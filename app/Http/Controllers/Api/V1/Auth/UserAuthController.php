@@ -6,7 +6,12 @@ use App\Http\Controllers\Controller;
 use App\Http\Traits\ApiResponseTrait; // <-- USE TRAIT
 use App\Mail\PasswordChangedMail;
 use App\Mail\WelcomeUserMail;
+use App\Models\Payment;
+use App\Models\UserTeamActivationSlot;
+use App\Models\PromoCodeRedemption;
+use App\Models\Team;
 use Illuminate\Http\Request;
+use Illuminate\Pagination\LengthAwarePaginator;
 use Illuminate\Support\Facades\Hash;
 use Illuminate\Support\Facades\Validator;
 use App\Models\User;
@@ -27,6 +32,48 @@ class UserAuthController extends Controller
 
     protected $guard = 'api_user';
     protected const OTP_EXPIRY_MINUTES = 10;
+
+    /**
+     * Validate the user's provided organization access code against their stored code.
+     * Route: POST /user/validate-organization-access-code
+     */
+    public function validateOrganizationAccessCode(Request $request)
+    {
+        /** @var \App\Models\User $user */
+        $user = $request->user();
+
+        $validator = Validator::make($request->all(), [
+            'organization_access_code' => 'required|string',
+        ]);
+
+        if ($validator->fails()) {
+            return $this->validationErrorResponse($validator);
+        }
+
+        $providedCode = $request->input('organization_access_code');
+
+        if (!$user->hasActiveSubscription()) {
+            return $this->errorResponse('You do not have an active subscription to use an organization access code.', Response::HTTP_FORBIDDEN);
+        }
+
+        if (empty($user->organization_access_code)) {
+            // This case implies a subscription might be active but code wasn't generated/assigned,
+            // which would be an internal issue.
+            Log::error("User {$user->id} has active sub but no organization_access_code stored.");
+            return $this->errorResponse('Access code not found for your account. Please contact support.', Response::HTTP_INTERNAL_SERVER_ERROR);
+        }
+
+        if (strtoupper($providedCode) === strtoupper($user->organization_access_code)) {
+            // Optionally return the main organization's ID if Flutter needs it explicitly
+            $mainOrganization = \App\Models\Organization::first(); // Assuming there's always one
+            return $this->successResponse(
+                ['organization_id' => $mainOrganization?->id, 'organization_name' => $mainOrganization?->name],
+                'Organization access code is valid.'
+            );
+        } else {
+            return $this->errorResponse('Invalid organization access code provided.', Response::HTTP_BAD_REQUEST);
+        }
+    }
 
     protected function formatTokenResponse($token, $user)
     {
@@ -283,5 +330,182 @@ class UserAuthController extends Controller
         // --- End Send Notification ---
 
         return $this->successResponse(null, 'Password changed successfully.', Response::HTTP_OK, false);
+    }
+    /**
+     * Display the authenticated user's history of their activation-initiating events
+     * (payments for team slots, or promos redeemed for team slots).
+     * Route: GET /user/activation-history
+     */
+    public function activationHistory(Request $request)
+    {
+        /** @var \App\Models\User $user */
+        $user = $request->user();
+
+        // Fetch Payments made by this user for "Team Activation Slots"
+        $paidActivations = Payment::where('user_id', $user->id)
+            // Filter for payments that are for UserTeamActivationSlot or directly for User credit
+            ->where(function ($query) use ($user) {
+                $query->where(function($q) use ($user) { // Payment for a slot purchased by this user
+                    $q->where('payable_type', UserTeamActivationSlot::class)
+                        ->whereIn('payable_id', $user->teamActivationSlots()->pluck('id'));
+                })
+                    ->orWhere(function($q) use ($user) { // Payment for User's own credit/activation (if applicable)
+                        $q->where('payable_type', User::class)
+                            ->where('payable_id', $user->id);
+                    });
+            })
+            ->where('status', 'succeeded')
+            ->select('id as record_id', 'payable_id', 'payable_type', 'amount', 'currency', 'status', 'paid_at as event_at', DB::raw("'Payment for Activation Slot/Credit' as type"))
+            ->orderBy('paid_at', 'desc') // Order before get
+            ->get();
+
+        // Fetch Promo Code Redemptions by this user for "Team Activation Slots"
+        $promoActivations = PromoCodeRedemption::where('user_id', $user->id)
+            ->where(function ($query) use ($user) { // Promos for slots
+                $query->where('redeemable_type', UserTeamActivationSlot::class)
+                    ->whereIn('redeemable_id', $user->teamActivationSlots()->pluck('id'));
+            })
+            ->with(['promoCode:id,code,description', 'redeemable']) // Eager load
+            ->select('id as record_id', 'promo_code_id', 'redeemable_id', 'redeemable_type', 'redeemed_at as event_at', DB::raw("'Promo for Activation Slot' as type"))
+            ->orderBy('redeemed_at', 'desc') // Order before get
+            ->get();
+
+        // Combine and map to a consistent structure
+        $history = $paidActivations->map(function ($payment) {
+            $description = "Team Activation Slot Purchase";
+            if ($payment->payable_type === UserTeamActivationSlot::class && $payment->payable) {
+                $description = "Slot ID: {$payment->payable->id}";
+                if ($payment->payable->team_id) {
+                    $team = Team::find($payment->payable->team_id); // Less efficient, consider eager loading if needed often
+                    $description .= " (Used for Team: " . ($team?->name ?? 'N/A') . ")";
+                }
+            }
+            return [
+                'record_id' => $payment->record_id,
+                'type' => $payment->type,
+                'date' => Carbon::parse($payment->event_at)->toIso8601String(),
+                'amount_display' => $payment->amount, // Accessor on Payment model handles dollar conversion
+                'currency' => $payment->currency,
+                'status' => $payment->status,
+                'description' => $description,
+            ];
+        })->concat(
+            $promoActivations->map(function ($redemption) {
+                $description = "Team Activation Slot via Promo";
+                if ($redemption->redeemable_type === UserTeamActivationSlot::class && $redemption->redeemable) {
+                    $description = "Slot ID: {$redemption->redeemable->id} (Promo: {$redemption->promoCode?->code})";
+                    if ($redemption->redeemable->team_id) {
+                        $team = Team::find($redemption->redeemable->team_id);
+                        $description .= " (Used for Team: " . ($team?->name ?? 'N/A') . ")";
+                    }
+                }
+                return [
+                    'record_id' => $redemption->record_id,
+                    'type' => $redemption->type,
+                    'date' => Carbon::parse($redemption->event_at)->toIso8601String(),
+                    'promo_code' => $redemption->promoCode?->code,
+                    'description' => $description,
+                ];
+            })
+        )->sortByDesc(function ($item) { // Ensure sorting by Carbon instance for accuracy
+            return Carbon::parse($item['date']);
+        })->values();
+
+        // Manual Pagination
+        $perPage = $request->input('per_page', 15);
+        $currentPage = $request->input('page', 1);
+        $currentPageItems = $history->slice(($currentPage - 1) * $perPage, $perPage)->values();
+        $paginatedHistory = new LengthAwarePaginator( // Use correct class
+            $currentPageItems, $history->count(), $perPage, $currentPage,
+            ['path' => $request->url(), 'query' => $request->query()]
+        );
+
+        return $this->successResponse($paginatedHistory, 'User activation history retrieved.');
+    }
+
+    /**
+     * Display the authenticated user's combined history of activations
+     * (payments for slots/teams or promos for slots/teams).
+     * Route: GET /user/activation-history
+     */
+    public function activationHistoryOld(Request $request)
+    {
+        /** @var \App\Models\User $user */
+        $user = $request->user();
+
+        // Fetch Payments made by this user for activation purposes
+        $paidActivations = Payment::where('user_id', $user->id)
+            ->where(function ($query) { // Payments for slots or direct team activations
+                $query->where('payable_type', UserTeamActivationSlot::class)
+                    ->orWhere('payable_type', Team::class); // Or just User::class if payment is for user credit
+            })
+            ->with([
+                'payable.team', // If slot is linked to a team later
+                'payable' // Eager load the polymorphic relation
+            ])
+            ->select('id as record_id', 'payable_id', 'payable_type', 'amount', 'currency', 'status', 'paid_at as event_at', DB::raw("'Payment' as type"))
+            ->get();
+
+        // Fetch Promo Code Redemptions by this user for activation purposes
+        $promoActivations = PromoCodeRedemption::where('user_id', $user->id)
+            ->where(function ($query) { // Promos for slots or direct team activations
+                $query->where('redeemable_type', UserTeamActivationSlot::class)
+                    ->orWhere('redeemable_type', Team::class);
+            })
+            ->with([
+                'promoCode:id,code,description',
+                'redeemable.team' // If slot is linked to a team
+            ])
+            ->select('id as record_id', 'promo_code_id', 'redeemable_id', 'redeemable_type', 'redeemed_at as event_at', DB::raw("'Promo Code' as type"))
+            ->get();
+
+        // Combine and map to a consistent structure
+        $history = $paidActivations->map(function ($payment) {
+            $target = null;
+            if ($payment->payable_type === UserTeamActivationSlot::class && $payment->payable) {
+                $target = "Team Activation Slot ID: {$payment->payable->id}";
+                if ($payment->payable->team) $target .= " (Used for Team: {$payment->payable->team->name})";
+            } elseif ($payment->payable_type === Team::class && $payment->payable) {
+                $target = "Team: {$payment->payable->name}";
+            }
+            return [
+                'record_id' => $payment->record_id,
+                'type' => $payment->type,
+                'date' => Carbon::parse($payment->event_at)->toIso8601String(),
+                'amount_display' => $payment->amount, // Accessor on Payment model handles dollar conversion
+                'currency' => $payment->currency,
+                'status' => $payment->status,
+                'description' => $target ?? "User Account Activation/Credit",
+            ];
+        })->concat(
+            $promoActivations->map(function ($redemption) {
+                $target = null;
+                if ($redemption->redeemable_type === UserTeamActivationSlot::class && $redemption->redeemable) {
+                    $target = "Team Activation Slot ID: {$redemption->redeemable->id}";
+                    if ($redemption->redeemable->team) $target .= " (Used for Team: {$redemption->redeemable->team->name})";
+                } elseif ($redemption->redeemable_type === Team::class && $redemption->redeemable) {
+                    $target = "Team: {$redemption->redeemable->name}";
+                }
+                return [
+                    'record_id' => $redemption->record_id,
+                    'type' => $redemption->type,
+                    'date' => Carbon::parse($redemption->event_at)->toIso8601String(),
+                    'promo_code' => $redemption->promoCode?->code,
+                    'description' => $target ?? "User Account Activation/Credit",
+                ];
+            })
+        )->sortByDesc('date')->values(); // Sort combined results by event date
+
+        // Manual Pagination for the combined collection
+        $perPage = $request->input('per_page', 15);
+        $currentPage = $request->input('page', 1);
+        $currentPageItems = $history->slice(($currentPage - 1) * $perPage, $perPage)->values();
+
+        $paginatedHistory = new \Illuminate\Pagination\LengthAwarePaginator(
+            $currentPageItems, $history->count(), $perPage, $currentPage,
+            ['path' => $request->url(), 'query' => $request->query()]
+        );
+
+        return $this->successResponse($paginatedHistory, 'User activation history retrieved.');
     }
 }

@@ -18,7 +18,6 @@ class AdminPaymentReceivedMail extends Mailable // implements ShouldQueue
 
     public Payment $payment;
     public User $user;
-    public Team $team;
 
     /**
      * Create a new message instance.
@@ -27,9 +26,8 @@ class AdminPaymentReceivedMail extends Mailable // implements ShouldQueue
     {
         $this->payment = $payment;
         // Eager load relationships if not already loaded when $payment is passed
-        $this->payment->loadMissing(['user', 'team']);
+        $this->payment->loadMissing(['user']);
         $this->user = $this->payment->user;
-        $this->team = $this->payment->team;
     }
 
     /**
@@ -52,7 +50,6 @@ class AdminPaymentReceivedMail extends Mailable // implements ShouldQueue
             with: [
                 'payment' => $this->payment,
                 'user' => $this->user,
-                'team' => $this->team,
                 'appName' => config('app.name'),
                 // Format amount for display
                 'amountFormatted' => number_format($this->payment->amount / 100, 2),

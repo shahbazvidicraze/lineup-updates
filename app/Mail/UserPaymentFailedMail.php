@@ -24,7 +24,7 @@ class UserPaymentFailedMail extends Mailable // implements ShouldQueue
     /**
      * Create a new message instance.
      */
-    public function __construct(User $user, Team $team, PaymentIntent $paymentIntent)
+    public function __construct(User $user, ?Team $team, PaymentIntent $paymentIntent)
     {
         $this->user = $user;
         $this->team = $team;
@@ -45,21 +45,14 @@ class UserPaymentFailedMail extends Mailable // implements ShouldQueue
     /**
      * Get the message content definition.
      */
-    public function content(): Content
-    {
-        return new Content(
-            markdown: 'emails.user.payment-failed',
-            with: [
-                'userName' => $this->user->first_name,
-                'appName' => config('app.name'),
-                'teamName' => $this->team->name,
-                'amountFormatted' => number_format($this->paymentIntent->amount / 100, 2),
-                'currency' => strtoupper($this->paymentIntent->currency),
-                'failureMessage' => $this->failureMessage,
-                // Optional: Link to update payment method or retry
-                // 'paymentRetryUrl' => route('web.teams.pay', $this->team->id), // Example
-            ],
-        );
+    public function content(): Content {
+        return new Content(markdown: 'emails.user.payment-failed', with: [
+            'userName' => $this->user->first_name, 'appName' => config('app.name'),
+            'targetName' => $this->team ? "team \"{$this->team->name}\"" : "your account activation", // Dynamic target
+            'amountFormatted' => number_format($this->paymentIntent->amount / 100, 2),
+            'currency' => strtoupper($this->paymentIntent->currency),
+            'failureMessage' => $this->failureMessage,
+        ]);
     }
 
     /**

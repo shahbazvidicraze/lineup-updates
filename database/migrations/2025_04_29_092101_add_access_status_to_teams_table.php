@@ -14,9 +14,9 @@ return new class extends Migration
         Schema::table('teams', function (Blueprint $table) {
             // Status options: 'inactive' (default), 'promo_active', 'paid_active'
             // Add more if needed (e.g., 'trial')
-            $table->string('access_status')->default('inactive')->after('state');
-            $table->timestamp('access_expires_at')->nullable()->after('access_status');
-            $table->index('access_status');
+//            $table->string('access_status')->default('inactive')->after('state');
+//            $table->timestamp('access_expires_at')->nullable()->after('access_status');
+//            $table->index('access_status');
         });
     }
 

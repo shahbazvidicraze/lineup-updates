@@ -2,132 +2,270 @@
 
 namespace App\Http\Controllers;
 
-use App\Models\Settings;
+use App\Models\Organization;
 use App\Models\Team;
-use App\Models\User; // Still needed to potentially get user info later
-// use Illuminate\Support\Facades\Auth; // No longer using web Auth facade here
-use Illuminate\Contracts\View\View;
-use Illuminate\Http\RedirectResponse;
+use App\Models\User;    // Import User model
+use App\Models\Settings;
+use http\Client\Response;
 use Illuminate\Http\Request;
 use Illuminate\Support\Facades\Log;
 use Stripe\Exception\ApiErrorException;
 use Stripe\PaymentIntent;
 use Stripe\Stripe;
+use Stripe\Customer as StripeCustomer;
+use Illuminate\Contracts\View\View;
+use Illuminate\Http\RedirectResponse; // For return type hint
 
 class WebPaymentController extends Controller
 {
     public function __construct()
     {
-        // ---- REMOVED AUTH MIDDLEWARE ----
-        // $this->middleware('auth');
-
+        // NO AUTH MIDDLEWARE HERE as it's accessed via signed URL
         Stripe::setApiKey(config('services.stripe.secret'));
-        Stripe::setApiVersion('2024-04-10');
+        Stripe::setApiVersion('2024-04-10'); // Use your desired API version
     }
 
     /**
-     * Show the payment initiation page for a team.
-     * WARNING: No user authentication here. Relies on webhook metadata.
+     * Show payment page for a User to purchase a "Team Activation Slot" (Path A).
+     * The {user} model is injected via route model binding from the signed URL.
+     * The 'signed' middleware on the route validates the URL's integrity.
+     * Route Name: 'team_activation_slot.payment.initiate.web'
      */
-    public function showPaymentPage(Request $request, Team $team): View|RedirectResponse
+    public function showTeamActivationSlotPage(Request $request, User $user): View
     {
-        // We don't know which user is initiating, CANNOT reliably check ownership here!
-        // Anyone knowing the team ID can reach this point.
-
-        // Check if team already has access (still useful)
-        if ($team->hasActiveAccess()) {
-            // Redirect or show message - maybe redirect to a generic success page?
-             return redirect('/')->with('info', 'Team ' . $team->name . ' already has active access.'); // Redirect to homepage
+        // $user is the one paying for the slot, validated by the signed URL.
+        // Optional: Check if user already has too many available slots.
+        $availableSlots = $user->teamActivationSlots()->where('status', 'available')->where('slot_expires_at', '>', now())->count();
+        if ($availableSlots >= 5) { // Example limit
+            return view('payments.failed', [
+                'pageTitle' => 'Limit Reached',
+                'messageBody' => 'You have reached the maximum number of available team activation slots.'
+            ]);
         }
-
-        // Fetch the owner of the team to store their info in metadata
-        // This assumes the webhook needs to know the owner, even if the web user isn't logged in.
-        $owner = $team->user; // Load the owner relationship
-        if (!$owner) {
-            Log::error("Web Flow (No Auth): Cannot find owner for Team ID {$team->id}. Cannot proceed.");
-            // Redirect back or show error view
-             return redirect('/')->with('error', 'Cannot process payment for this team due to missing owner information.');
-        }
-
 
         $settings = Settings::instance();
-        $amount = ($settings->unlock_price_amount*100); // Amount in cents
+        $amountInDollars = (float) $settings->unlock_price_amount;
         $currency = $settings->unlock_currency;
+        $amountInCents = (int) round($amountInDollars * 100);
+
+        if (strtolower($currency) === 'usd' && $amountInCents < 50) {
+            Log::error("Web Payment Error: Slot purchase amount {$amountInCents}c for User ID {$user->id} is below minimum.");
+            return view('payments.failed', ['pageTitle' => 'Payment Error', 'messageBody' => 'The activation price is below the minimum allowed. Please contact support.']);
+        }
+        if (empty($currency)) {
+            Log::error("Web Payment Error: Currency not set for slot purchase by User ID {$user->id}.");
+            return view('payments.failed', ['pageTitle' => 'Configuration Error', 'messageBody' => 'Payment currency is not configured. Please contact support.']);
+        }
 
         try {
+            if (!$user->stripe_customer_id) {
+                $customer = StripeCustomer::create(['email' => $user->email, 'name' => $user->full_name, 'metadata' => ['app_user_id' => $user->id]]);
+                $user->stripe_customer_id = $customer->id;
+                $user->saveQuietly();
+            }
+
             $paymentIntent = PaymentIntent::create([
-                'amount' => $amount,
+                'amount' => $amountInCents,
                 'currency' => $currency,
+                'customer' => $user->stripe_customer_id,
                 'automatic_payment_methods' => ['enabled' => true],
-                'description' => "Web Access unlock for Team: {$team->name} (ID: {$team->id})",
+                'description' => "Team Activation Slot Purchase by {$user->email} ({$user->id})",
                 'metadata' => [
-                    'team_id' => $team->id,
-                    'team_name' => $team->name,
-                    // Store the OWNER's ID and email from the team relationship
-                    'user_id' => $owner->id,
-                    'user_email' => $owner->email,
-                    'trigger_source' => 'web_flow_no_auth', // Identify source
+                    'paying_user_id' => $user->id, // User purchasing the slot
+                    'user_email' => $user->email,
+                    'action' => 'purchase_team_activation_slot' // For webhook processing
                 ],
             ]);
+            Log::info("Web Flow: Created Team Activation Slot PI {$paymentIntent->id} for User ID {$user->id}");
 
-            Log::info("Web Flow (No Auth): Created PaymentIntent {$paymentIntent->id} for Team ID {$team->id}, Owner ID {$owner->id}");
-
-            return view('payments.initiate', [
+            return view('payments.subscribe_page', [ // Using a generic payment page view
                 'stripeKey' => config('services.stripe.key'),
                 'clientSecret' => $paymentIntent->client_secret,
-                'team' => $team,
-                'amount' => $amount,
+                'paymentTitle' => "Purchase Team Activation Slot",
+                'paymentDescription' => "Complete your payment to receive a slot for activating one team with premium features for " . ($settings->access_duration_days ?? 365) . " days.",
+                'user' => $user, // For displaying "Welcome, [User Name]" in navbar
+                'displayAmount' => number_format($amountInDollars, 2),
+                'displayCurrencySymbol' => $settings->unlock_currency_symbol,
+                'displayCurrencySymbolPosition' => $settings->unlock_currency_symbol_position,
                 'currency' => $currency,
-                 'returnUrl' => route('payment.return'), // Return URL remains the same
+                'returnUrl' => route('payment.return.general'), // Generic return URL
             ]);
-
         } catch (ApiErrorException $e) {
-            Log::error("Web Flow (No Auth): Stripe PI creation failed for Team ID {$team->id}: " . $e->getMessage());
-            return redirect('/')->with('error', 'Could not initiate payment. Please try again later.');
+            Log::error("Web Flow: Stripe Team Slot PI API error for User {$user->id}: " . $e->getMessage());
+            return view('payments.failed', ['pageTitle' => 'Payment Initiation Failed', 'messageBody' => 'Failed to initiate payment: ' . ($e->getError()?->message ?: 'Stripe API error.')]);
         } catch (\Exception $e) {
-             Log::error("Web Flow (No Auth): Generic error initiating payment for Team ID {$team->id}: " . $e->getMessage());
-             return redirect('/')->with('error', 'An unexpected error occurred.');
+            Log::error("Web Flow: Generic error Team Slot PI for User {$user->id}: " . $e->getMessage());
+            return view('payments.failed', ['pageTitle' => 'Error', 'messageBody' => 'An unexpected error occurred while initiating your payment.']);
         }
     }
 
     /**
-     * Handle the return URL redirect from Stripe after payment attempt.
-     * Still relies on webhook for granting access.
+     * Show payment page for an Organization Admin to RENEW their Organization's subscription.
+     * {organization} is injected via route model binding from the signed URL.
+     * Route: GET /pay-for-organization-renewal/{organization} (Web, Signed, named 'organization.payment.initiate.renewal')
      */
-    public function handleReturn(Request $request): View
+    public function showOrganizationRenewalPage(Request $request, Organization $organization): View
     {
-        // This method remains largely the same, as it primarily checks the PI status from Stripe
-        // based on query parameters, not the logged-in user state.
+        // $organization is the one whose subscription is being renewed.
+        // The 'signed' middleware has validated the URL.
 
-        $paymentIntentId = $request->query('payment_intent');
-        // ... rest of handleReturn method remains the same as previous answer ...
-        // ... retrieving PI, checking status, returning success/processing/failed view ...
+        $settings = Settings::instance();
+        $amountInDollars = (float) $settings->unlock_price_amount;
+        $currency = $settings->unlock_currency;
+        $amountInCents = (int) round($amountInDollars * 100);
 
-        // --- (Copy the rest of handleReturn from the previous answer here) ---
-        if (!$paymentIntentId) {
-            Log::warning("Payment Return: Missing payment_intent ID in return URL.");
-            return view('payments.failed', ['message' => 'Payment details missing.']);
+        if ($organization->hasActiveSubscription() && $organization->subscription_expires_at->gt(now()->addMonths(1))) { // Example: 1 month buffer
+            return view('payments.success', [
+                'pageTitle' => 'Subscription Active',
+                'messageBody' => "Organization '{$organization->name}' already has an active subscription until " . $organization->subscription_expires_at->toFormattedDayDateString() . ". Renewal can be done closer to the expiry date."
+            ]);
         }
+
+        if ($organization->hasActiveSubscription() && $organization->subscription_expires_at->gt(now()->addMonths(11))) {
+            return view('payments.pre-activated', [ // Or a different view
+                'pageTitle' => 'Subscription Already Active',
+                'message' => "Organization '{$organization->name}' already has an active subscription. Renewal can be done closer to the expiry date (" . $organization->subscription_expires_at->toFormattedDayDateString() . ").",
+                'displayAmount' => number_format($amountInDollars,2),
+                'displayCurrencySymbol' => $settings->unlock_currency_symbol,
+                'displayCurrencySymbolPosition' => $settings->unlock_currency_symbol_position,
+                'currency' => $currency,
+            ]);
+        }
+
+        // Validate amount and currency before creating PI
+        if (strtolower($currency) === 'usd' && $amountInCents < 50) {
+            Log::error("Web Flow: PI creation failed for Org ID {$organization->id}: Amount {$amountInCents} cents < minimum.");
+            return view('payments.failed', ['panel_name' => $organization->name,'amount' => $amountInDollars, 'currency' => $currency, 'message' => 'Subscription amount is below the minimum allowed.']);
+        }
+        if (empty($currency)) {
+            Log::error("Web Flow: PI creation failed: Currency not set in settings.");
+            return view('payments.failed', ['panel_name' => $organization->name,'amount' => $amountInDollars, 'currency' => $currency, 'message' => 'Payment configuration error (currency).']);
+        }
+
+        try {
+            $stripeCustomerIdForPayment = $organization->stripe_customer_id;
+
+            // If the Organization doesn't have its own Stripe Customer ID, create one using its email.
+            if (!$stripeCustomerIdForPayment) {
+                if (empty($organization->email)) {
+                    Log::error("Web Flow Renew Error: Org ID {$organization->id} has no email set to create Stripe Customer.");
+                    return view('payments.failed', ['panel_name' => $organization->name, 'amount' => $amountInDollars, 'currency' => $currency, 'pageTitle' => 'Configuration Error', 'messageBody' => 'Organization contact email is missing. Cannot proceed with renewal.']);
+                }
+                Log::info("Web Flow Renew: Creating Stripe Customer for Org ID {$organization->id} using email {$organization->email}.");
+                $customer = StripeCustomer::create([
+                    'email' => $organization->email,
+                    'name' => $organization->name, // Use Organization name
+                    'metadata' => ['app_organization_id' => $organization->id] // Link Stripe Customer to your Org ID
+                ]);
+                $stripeCustomerIdForPayment = $customer->id;
+                // Save this new Stripe Customer ID back to the Organization record
+                $organization->stripe_customer_id = $stripeCustomerIdForPayment;
+                $organization->saveQuietly();
+            }
+            Log::info("Web Flow Renew: Using Stripe Customer ID {$stripeCustomerIdForPayment} for Org ID {$organization->id} renewal.");
+
+            $paymentIntent = PaymentIntent::create([
+                'amount' => $amountInCents,
+                'currency' => $currency,
+                'customer' => $stripeCustomerIdForPayment, // Use the Organization's Stripe Customer ID
+                'automatic_payment_methods' => ['enabled' => true],
+                'description' => "Renewal Subscription for Organization: {$organization->name} ({$organization->organization_code})",
+                'metadata' => [
+                    'organization_id' => $organization->id,
+                    'organization_code' => $organization->organization_code,
+                    // 'paying_user_id' is less relevant here if payment is by "the organization" itself.
+                    // Could add creator_user_id if you want to log who *might* be doing it via panel.
+                    'action' => 'renew_organization_subscription'
+                ],
+            ]);
+            Log::info("Web Flow: Org Renewal PI {$paymentIntent->id} created for Org ID {$organization->id}");
+
+            // $actingUser for the view can be a generic representation or null if no specific user logged into panel
+            // For "Welcome, [User Name]", we might not have a User model if Org Admin logs in with org_code.
+            // The view should handle $actingUser being potentially null or an object with a 'name' property.
+            $actingUserDisplay = (object)['first_name' => $organization->name]; // Display Organization name
+
+            return view('payments.subscribe_page', [
+                'stripeKey' => config('services.stripe.key'),
+                'clientSecret' => $paymentIntent->client_secret,
+                'paymentTitle' => "Renew Subscription: {$organization->name}",
+                'paymentDescription' => "You are renewing the annual subscription for Organization: {$organization->name} ({$organization->organization_code}).",
+                'user' => $actingUserDisplay, // Pass an object with a 'name' property for display
+                'displayAmount' => number_format($amountInDollars,2),
+                'displayCurrencySymbol' => $settings->unlock_currency_symbol,
+                'displayCurrencySymbolPosition' => $settings->unlock_currency_symbol_position,
+                'currency' => $currency,
+                'returnUrl' => route('payment.return.general'),
+            ]);
+        } catch (ApiErrorException $e) {
+            Log::error("Web Flow: Stripe Org Renewal PI API error for Org ID {$organization->id}: " . $e->getMessage());
+            return view('payments.failed', ['panel_name' => $organization->name,'amount' => $amountInDollars, 'currency' => $currency, 'pageTitle' => 'Renewal Failed', 'message' => 'Failed to initiate renewal: ' . ($e->getError()?->message ?: 'Stripe API error.')]);
+        } catch (\Exception $e) {
+            Log::error("Web Flow: Generic error initiating Org Renewal for Org ID {$organization->id}: " . $e->getMessage());
+            return view('payments.failed', ['panel_name' => $organization->name,'amount' => $amountInDollars, 'currency' => $currency, 'pageTitle' => 'Renewal Error', 'message' => 'An unexpected error occurred.']);
+        }
+    }
+
+    /**
+     * Generic handle return URL from Stripe for both new org and renewal.
+     */
+    public function handleGenericReturn(Request $request): View
+    {
+        $paymentIntentId = $request->query('payment_intent');
+        $settings = Settings::instance();
+        $amountInDollars = (float) $settings->unlock_price_amount;
+        $currency = $settings->unlock_currency;
+        $amountInCents = (int) round($amountInDollars * 100);
+
+        if (!$paymentIntentId) {
+            return view('payments.failed', ['title'=>'Error', 'message'=>'Payment details missing.']);
+        }
+        $organization = null;
         try {
             $paymentIntent = PaymentIntent::retrieve($paymentIntentId);
-            Log::info("Payment Return: Handling PI {$paymentIntent->id} with status {$paymentIntent->status}");
+            Log::info("Generic Payment Return: Handling PI {$paymentIntent->id}, Status: {$paymentIntent->status}");
+
             if ($paymentIntent->status === 'succeeded') {
-                 $teamId = $paymentIntent->metadata->team_id ?? null;
-                 $teamName = $paymentIntent->metadata->team_name ?? 'your team';
-                 return view('payments.success', ['teamId' => $teamId, 'teamName' => $teamName]);
+                $action = $paymentIntent->metadata->action ?? 'payment';
+                $message = 'Your payment was successful. ';
+
+                $userId = $paymentIntent->metadata->paying_user_id ?? null; // Could get user to personalize
+                $user = User::find($userId);
+
+                if ($action === 'purchase_team_activation_slot') {
+                    $message .= 'Your Team Activation Slot is being processed and will be available shortly. Check your email for confirmation.';
+                } elseif ($action === 'renew_organization_subscription') {
+                    $orgId = $paymentIntent->metadata->organization_id ?? $paymentIntent->metadata->organization_code ;
+                    $organization = Organization::find($orgId);
+                    $user = (object)['first_name' => $organization->name]; // Display Organization name
+
+                    $orgName = $paymentIntent->metadata->organization_name_from_pi ?? ($paymentIntent->metadata->organization_code ?? 'your organization');
+                    $message .= "Subscription renewal for '{$orgName}' is being processed and will be updated shortly. Check your email for confirmation.";
+                } else {
+                    $message .= 'Your account or service status will be updated shortly via email.';
+                }
+                return view('payments.success', [
+                    'user' => $user, // For displaying user info if needed
+                    'displayAmount' => number_format($amountInDollars, 2),
+                    'displayCurrencySymbol' => $settings->unlock_currency_symbol,
+                    'displayCurrencySymbolPosition' => $settings->unlock_currency_symbol_position,
+                    'currency' => $currency,
+                    'title' => 'Payment Successful!',
+                    'message' => $message,
+                ]);
+
             } elseif ($paymentIntent->status === 'processing') {
-                 return view('payments.processing');
+                return view('payments.processing', ['title'=>'Payment Processing', 'message'=>'Your payment is processing. We will notify you once confirmed.']);
             } else {
-                 Log::warning("Payment Return: PaymentIntent {$paymentIntent->id} status is {$paymentIntent->status}");
-                 return view('payments.failed', ['message' => 'Payment attempt failed or requires action. Please try again.']);
+                $failureReason = $paymentIntent->last_payment_error->message ?? 'Payment not successful.';
+                return view('payments.failed', ['title'=>'Payment Issue', 'message'=> $failureReason]);
             }
         } catch (ApiErrorException $e) {
-             Log::error("Payment Return: Error retrieving PI {$paymentIntentId}: " . $e->getMessage());
-             return view('payments.failed', ['message' => 'Could not verify payment status.']);
+            Log::error("Generic Payment Return: Stripe API Error for PI {$paymentIntentId}: " . $e->getMessage());
+            return view('payments.failed', ['messageTitle'=>'Verification Error', 'messageBody'=>'Could not verify your payment status. Please check your email for confirmation or contact support.']);
         } catch (\Exception $e) {
-             Log::error("Payment Return: Generic error handling return for PI {$paymentIntentId}: " . $e->getMessage());
-             return view('payments.failed', ['message' => 'An unexpected error occurred verifying payment.']);
+            Log::error("Generic Payment Return: General Error for PI {$paymentIntentId}: " . $e->getMessage());
+            return view('payments.failed', ['messageTitle'=>'Error', 'messageBody'=>'An unexpected error occurred while verifying your payment. Please check for an email from us or contact support.']);
         }
-        // --- End copied section ---
     }
 }

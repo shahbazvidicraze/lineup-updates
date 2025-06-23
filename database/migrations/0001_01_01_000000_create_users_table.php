@@ -17,6 +17,7 @@ return new class extends Migration
             $table->string('last_name');
             $table->string('email')->unique();
             $table->string('phone')->nullable()->unique();
+            $table->string('stripe_customer_id')->nullable()->unique();
             $table->boolean('receive_payment_notifications')->default(true);
             $table->timestamp('email_verified_at')->nullable();
             $table->integer('role_id')->default(2);

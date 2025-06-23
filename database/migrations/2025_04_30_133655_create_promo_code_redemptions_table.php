@@ -10,14 +10,13 @@ return new class extends Migration
     {
         Schema::create('promo_code_redemptions', function (Blueprint $table) {
             $table->id();
-            $table->foreignId('user_id')->constrained('users')->cascadeOnDelete();
+            $table->foreignId('user_id')->nullable()->constrained('users')->cascadeOnDelete(); // User who redeemed
             $table->foreignId('promo_code_id')->constrained('promo_codes')->cascadeOnDelete();
-            $table->foreignId('team_id')->nullable()->constrained('teams')->nullOnDelete(); // Optional: Link redemption to a specific team
-            $table->timestamp('redeemed_at');
-            // Removed unique constraint to allow multiple redemptions if max_uses_per_user > 1 or team_id is used
-            // Add back if needed: $table->unique(['user_id', 'promo_code_id', 'team_id']); // Adjust uniqueness based on rules
+            $table->foreignId('organization_id')->nullable()->constrained('organizations')->nullOnDelete(); // Link to Organization
 
-            // No need for timestamps() here unless tracking updates to the redemption record itself
+            $table->morphs('redeemable'); // Adds redeemable_id and redeemable_type
+
+            $table->timestamp('redeemed_at');
         });
     }
 

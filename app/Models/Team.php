@@ -2,33 +2,28 @@
 
 namespace App\Models;
 
-use App\Models\Settings;
 use Illuminate\Database\Eloquent\Factories\HasFactory;
 use Illuminate\Database\Eloquent\Model;
 use Carbon\Carbon;
+use App\Models\Settings;
+use App\Models\UserTeamActivationSlot;
 
 class Team extends Model
 {
     use HasFactory;
 
     protected $fillable = [
-        'user_id',
-        'organization_id',
-        'name',
-        'season',
-        'year',
-        'sport_type',
-        'team_type',
-        'age_group',
-        'city',
-        'state',
-        'access_status',      // Added
-        'access_expires_at',  // Added
+        'user_id', 'organization_id', 'name', 'sport_type', 'team_type', 'age_group',
+        'city', 'state', 'country',
+        'direct_activation_status', 'direct_activation_expires_at',
+        'is_editable_until', 'is_setup_complete'
     ];
 
     protected $casts = [
         'year' => 'integer',
-        'access_expires_at' => 'datetime', // Added
+        'direct_activation_expires_at' => 'datetime',
+        'is_editable_until' => 'datetime',
+        'is_setup_complete' => 'boolean'
     ];
 
     // --- Relationships ---
@@ -53,85 +48,61 @@ class Team extends Model
         return $this->hasMany(Game::class);
     }
 
-    public function promoCodeRedemptions()
-    {
-        return $this->hasMany(PromoCodeRedemption::class);
+    public function directPayments() { return $this->morphMany(Payment::class, 'payable'); }
+    public function directPromoRedemptions() { return $this->morphMany(PromoCodeRedemption::class, 'redeemable'); }
+
+    public function isEditable(): bool {
+        return !$this->is_editable_until || $this->is_editable_until->isFuture();
     }
 
-    public function payments() // Relationship to payments table
-    {
-        return $this->hasMany(Payment::class);
-    }
-
-
-    // --- Helper Methods ---
-
-    /**
-     * Check if the team currently has active access (paid or promo).
-     */
-    public function hasActiveAccess(): bool
-    {
-        // Check status first
-        if (!in_array($this->access_status, ['paid_active', 'promo_active'])) {
-            return false;
-        }
-
-        // Check expiry (if it exists)
-        if ($this->access_expires_at && $this->access_expires_at->isPast()) {
-            // Optional: Add logic here to automatically set status to 'inactive' if expired
-            // $this->access_status = 'inactive';
-            // $this->saveQuietly(); // Avoid triggering events if needed
-            return false;
-        }
-
-        // Status is active and not expired (or expiry is null)
-        return true;
-    }
-
-    /**
-     * NEW METHOD: Check if the team's access has specifically expired.
-     * This assumes that if access_status is 'paid_active' or 'promo_active'
-     * but access_expires_at is in the past, then it's an "expired" state.
-     */
-    public function hasAccessExpired(): bool
-    {
-        // It can only be considered "expired" if it once had an active status
-        // and has an expiry date that is now in the past.
-        if (in_array($this->access_status, ['paid_active', 'promo_active']) &&
-            $this->access_expires_at &&
-            $this->access_expires_at->isPast()) {
+    // This method determines if PDF and other premium features are available
+    public function hasPremiumAccess(): bool {
+        // Path A: Direct team activation
+        if ($this->direct_activation_status === 'active' &&
+            $this->direct_activation_expires_at &&
+            $this->direct_activation_expires_at->isFuture()) {
             return true;
+        }
+        // Path B: Inherited from Organization
+        if ($this->organization_id && $this->organization) {
+            $this->loadMissing('organization'); // Ensure org is loaded
+            return $this->organization->hasActiveSubscription();
         }
         return false;
     }
 
     /**
-     * Grant access via Promo Code using duration from settings.
-     * @return Carbon The calculated expiry date.
+     * Activates this team directly using a pre-paid/promo slot.
+     * Consumes a UserTeamActivationSlot.
      */
-    public function grantPromoAccess(): Carbon
+    public function activateWithSlot(UserTeamActivationSlot $slot): bool
     {
-        $settings = Settings::instance();
-        $durationDays = $settings->access_duration_days > 0 ? $settings->access_duration_days : 365;
+        if ($slot->user_id !== $this->user_id || $slot->status !== 'available' || $slot->slot_expires_at->isPast()) {
+            return false; // Slot not valid for this team/user or expired
+        }
 
-        $this->access_status = 'promo_active';
-        $this->access_expires_at = Carbon::now()->addDays($durationDays);
+        $this->direct_activation_status = 'active';
+        $this->direct_activation_expires_at = $slot->slot_expires_at;
+        $this->is_setup_complete = true; // Assuming details are provided now or will be
+        if (!$this->is_editable_until) { // Set initial editability window if not already set
+            $this->is_editable_until = Carbon::now()->addYear();
+        }
         $this->save();
-        return $this->access_expires_at; // Return the expiry date
+
+        // Mark the slot as used and link it to this team
+        $slot->status = 'used';
+        $slot->team_id = $this->id;
+        $slot->save();
+
+        return true;
     }
 
-    /**
-     * Grant access via Payment using duration from settings.
-     * @return Carbon The calculated expiry date.
-     */
-    public function grantPaidAccess(): Carbon // Removed $expiresAt parameter
-    {
-        $settings = Settings::instance();
-        $durationDays = $settings->access_duration_days > 0 ? $settings->access_duration_days : 365;
-
-        $this->access_status = 'paid_active';
-        $this->access_expires_at = Carbon::now()->addDays($durationDays);
+    public function activateDirectly(Carbon $expiresAt): void {
+        $this->direct_activation_status = 'active';
+        $this->direct_activation_expires_at = $expiresAt;
+        if (!$this->is_editable_until) { // Set initial editability window
+            $this->is_editable_until = Carbon::now()->addYear();
+        }
         $this->save();
-        return $this->access_expires_at; // Return the expiry date
     }
 }

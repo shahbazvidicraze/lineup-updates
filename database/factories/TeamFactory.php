@@ -40,8 +40,6 @@ class TeamFactory extends Factory
             'age_group' => $ageGroup,
             'city' => fake()->city(),
             'state' => fake()->stateAbbr(),
-            'access_status' => 'inactive', // Default status
-            'access_expires_at' => null,
         ];
     }
 }

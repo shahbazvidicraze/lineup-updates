@@ -23,6 +23,17 @@ return new class extends Migration
             $table->string('age_group'); // e.g., "11u", "Varsity"
             $table->string('city')->nullable();
             $table->string('state')->nullable();
+            $table->string('country')->nullable();
+
+            // For Path A: Direct Team Activation
+            $table->string('direct_activation_status')->default('inactive');
+            $table->timestamp('direct_activation_expires_at')->nullable();
+
+            // For all teams: when their editability expires
+            $table->timestamp('is_editable_until')->nullable();
+
+            // For placeholder team workflow
+            $table->boolean('is_setup_complete')->default(false);
             $table->timestamps();
         });
     }
