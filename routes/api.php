@@ -145,7 +145,13 @@ Route::prefix('v1')->group(function () {
 
     // --- ORGANIZATION PANEL ROUTES ---
     // Public login for Organization Panel (uses Organization code as username)
-    Route::post('organization-panel/auth/login', [OrganizationPanelController::class, 'login']);
+    Route::prefix('organization-panel/auth')->controller(OrganizationPanelController::class)->group(function () {
+        Route::post('login', 'login'); // Existing public login
+
+        // NEW Public routes for Organization Password Reset
+        Route::post('forgot-password', 'forgotPassword');
+        Route::post('reset-password', 'resetPassword');
+    });
 
     // Protected Organization Panel Routes (Requires Organization JWT: auth:api_org_admin)
     Route::prefix('organization-panel')->middleware('auth:api_org_admin')->group(function () {

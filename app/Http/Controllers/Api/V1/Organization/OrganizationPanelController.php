@@ -10,6 +10,7 @@ use App\Models\Team;
 use App\Models\Settings; // For renewal price
 use App\Models\User;
 use App\Mail\OrganizationSubscriptionRenewedViaPromoMail;
+use App\Mail\OrganizationPasswordResetOtpMail;
 use Carbon\Carbon;
 use Illuminate\Http\Request;
 use Illuminate\Http\Response;
@@ -20,6 +21,7 @@ use Illuminate\Support\Facades\Log;
 use Illuminate\Support\Facades\Mail;
 use Illuminate\Support\Facades\URL;
 use Illuminate\Support\Facades\Validator;
+use Illuminate\Support\Str;
 use Tymon\JWTAuth\Facades\JWTAuth;
 use Illuminate\Validation\Rules\Password;
 use Stripe\PaymentIntent; // For renewal
@@ -30,6 +32,7 @@ class OrganizationPanelController extends Controller
 {
     use ApiResponseTrait;
     protected $guard = 'api_org_admin'; // Define guard
+    protected const OTP_EXPIRY_MINUTES = 10; // OTP expiry time for orgs
 
     public function __construct() {
         Stripe::setApiKey(config('services.stripe.secret')); // For renewal intent
@@ -464,6 +467,113 @@ class OrganizationPanelController extends Controller
         } catch (\Exception $e) {
             \Illuminate\Support\Facades\Log::error("Failed to generate renewal link for Org ID {$organization->id}: " . $e->getMessage());
             return $this->errorResponse('Could not generate renewal link.', Response::HTTP_INTERNAL_SERVER_ERROR);
+        }
+    }
+
+    // --- NEW: Organization Password Reset Methods (Public for Org Panel context) ---
+
+    /**
+     * Send Password Reset OTP to Organization's Email.
+     * Route: POST /organization-panel/auth/forgot-password (Public for Org Panel)
+     */
+    public function forgotPassword(Request $request)
+    {
+        $validator = Validator::make($request->all(), [
+            'email' => 'required|email|exists:organizations,email', // Check against org emails
+        ]);
+
+        if ($validator->fails()) {
+            return $this->validationErrorResponse($validator);
+        }
+
+        $organization = Organization::where('email', $request->email)->first();
+        if (!$organization) {
+            // Should be caught by 'exists' rule, but good to double check
+            return $this->notFoundResponse('Organization with this email not found.');
+        }
+        if (empty($organization->email)) { // Extra check if email was somehow nullable and empty
+            return $this->errorResponse('This organization does not have a registered email for password reset.', Response::HTTP_BAD_REQUEST);
+        }
+
+
+        $otp = Str::padLeft((string) random_int(0, 999999), 6, '0');
+        $expiresAt = Carbon::now()->addMinutes(self::OTP_EXPIRY_MINUTES)->toDateTimeString();
+        $now = Carbon::now()->toDateTimeString();
+
+        try {
+            // Using DB::table for password_reset_otps table.
+            // The primary key 'email' will now store the Organization's email.
+            DB::table('password_reset_otps')->updateOrInsert(
+                ['email' => $organization->email],
+                ['otp' => $otp, 'expires_at' => $expiresAt, 'created_at' => $now]
+            );
+            Log::info("OTP stored/updated for Organization email: {$organization->email}");
+
+        } catch (\Exception $e) {
+            Log::error('Failed to store password reset OTP for Organization: ' . $e->getMessage(), [
+                'organization_email' => $organization->email, 'exception' => $e
+            ]);
+            return $this->errorResponse('Could not process your password reset request.', Response::HTTP_INTERNAL_SERVER_ERROR);
+        }
+
+        try {
+            Mail::to($organization->email)->send(new OrganizationPasswordResetOtpMail($otp, $organization));
+            return $this->successResponse(null, 'Password reset OTP has been sent to the organization\'s contact email.', Response::HTTP_OK, false);
+        } catch (\Exception $e) {
+            Log::error('Failed to send org password reset OTP email: ' . $e->getMessage(), ['organization_email' => $organization->email]);
+            return $this->errorResponse('Could not send OTP email. Please try again later.', Response::HTTP_INTERNAL_SERVER_ERROR);
+        }
+    }
+
+    /**
+     * Reset Organization's Password using OTP.
+     * Route: POST /organization-panel/auth/reset-password (Public for Org Panel)
+     */
+    public function resetPassword(Request $request)
+    {
+        $validator = Validator::make($request->all(), [
+            'email' => 'required|email|exists:organizations,email', // Org's email
+            'otp' => 'required|string|digits:6',
+            'password' => ['required', 'confirmed', Password::defaults()], // New password for the org
+        ]);
+
+        if ($validator->fails()) {
+            return $this->validationErrorResponse($validator);
+        }
+
+        $otpRecord = DB::table('password_reset_otps')
+            ->where('email', $request->email) // Org's email
+            ->where('otp', $request->otp)
+            ->first();
+
+        if (!$otpRecord) {
+            return $this->errorResponse('Invalid or incorrect OTP.', Response::HTTP_BAD_REQUEST);
+        }
+
+        if (Carbon::parse($otpRecord->expires_at)->isPast()) {
+            DB::table('password_reset_otps')->where('email', $request->email)->delete();
+            return $this->errorResponse('OTP has expired. Please request a new one.', Response::HTTP_BAD_REQUEST);
+        }
+
+        $organization = Organization::where('email', $request->email)->first();
+        if (!$organization) { // Should be caught by 'exists' rule
+            return $this->notFoundResponse('Organization not found for password reset.');
+        }
+
+        try {
+            $organization->password = $request->password; // Model's $casts will hash it
+            $organization->save();
+
+            DB::table('password_reset_otps')->where('email', $request->email)->delete();
+
+            // Optionally: Invalidate any active JWTs for this organization if possible/needed
+            // This is complex with JWTs as they are stateless.
+            // Forcing a re-login by just changing the password is often sufficient.
+
+            return $this->successResponse(null, 'Organization panel password has been reset successfully.', Response::HTTP_OK, false);
+        } catch (\Exception $e) {
+            Log::error('Failed to reset organization password for: ' . $request->email . '. Error: ' . $e->getMessage(), ['exception' => $e]);
+            return $this->errorResponse('Could not reset password at this time.', Response::HTTP_INTERNAL_SERVER_ERROR);
         }
     }
 }
