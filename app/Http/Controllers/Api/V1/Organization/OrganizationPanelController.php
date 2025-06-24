@@ -404,7 +404,7 @@ class OrganizationPanelController extends Controller
         $history = $paidActivations->map(function ($payment) {
             return [
                 'record_id' => $payment->record_id,
-                'type' => $payment->type,
+                'type' => "Paid",
                 'date' => Carbon::parse($payment->event_at)->toIso8601String(),
                 'amount_display' => $payment->amount, // Accessor handles dollar conversion
                 'currency' => $payment->currency,
@@ -417,7 +417,7 @@ class OrganizationPanelController extends Controller
             $promoActivations->map(function ($redemption) {
                 return [
                     'record_id' => $redemption->record_id,
-                    'type' => $redemption->type,
+                    'type' => "Promo",
                     'date' => Carbon::parse($redemption->event_at)->toIso8601String(),
                     'promo_code' => $redemption->promoCode?->code,
                     'activated_by_user_id' => $redemption->user_id,

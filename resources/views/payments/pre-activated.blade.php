@@ -39,7 +39,7 @@
             user-select: none;
         }
         .left-panel > h2 > span {
-            font-size: 1.8em;
+            font-size: 1.7em;
             line-height: 0.85 !important;
             color: #054b8e;
         }
@@ -103,7 +103,7 @@
                         <img src="{{ asset('/web/assets/assets/images/dummy_image.png') }}" alt="Avatar Logo" style="width:40px;" class="bg-blue rounded-pill ">
                         <div class="d-flex flex-column m-0 p-0 justify-content-center">
                             <h6 style="line-height: 0.6" class="mt-1 mb-0 p-0 text-maroon">Welcome <span style="font-weight: 200 !important;">&#128075;</span></h6>
-                            <p class="m-0 p-0">{{ $user->first_name }}</p>
+                            <p class="m-0 p-0">{{ isset($user->first_name) ? $user->first_name : $panel_name }}</p>
                         </div>
                     </div>
                 </li>
@@ -115,8 +115,11 @@
 <div class="main-container container">
     <!-- Left Panel -->
     <div class="left-panel text-center">
-        <h2>PURCHASE YOUR ANNUAL <span class="fw-bold">SUBSCRIPTION</span></h2> {{-- Changed Text --}}
-        <h4 class="mb-2 text-secondary">{{ config('app.name', 'Lineup Hero') }} Premium Access</h4> {{-- Changed Text --}}
+        <h2>{{ $type == 'organization' ? 'RENEW' :  'PURCHASE' }} THE PREMIUM <span class="fw-bold">SUBSCRIPTION</span></h2> {{-- Changed Text --}}
+        @if(isset($paymentDescription))
+            <p class="payment-description px-3 text-secondary">{{ $paymentDescription }}</p>
+        @endif
+        {{--        <h4 class="mb-2 text-secondary">{{ config('app.name', 'Lineup Hero') }} Premium Access</h4> --}}{{-- Changed Text --}}
 
         {{-- Use variables passed from WebPaymentController --}}
         <div class="price-text my-5">
@@ -201,9 +204,9 @@
                 <h5 class="modal-title w-100 text-maroon" id="paymentSuccessModalLabel">{{$title}}</h5>
             </div>
             <div class="modal-body">
-                <p class="mb-3">{{$message}}</p>
+                <p class="mb-3">{{$messageBody}}</p>
                 <div class="d-flex gap-2 justify-content-center">
-                    <a href="{{url('/web')}}" class="btn btn-blue">Go to Home</a>
+                    <a href="{{ $type == 'user' ? url('/web/#/main-dashboard-screen') : ($type == 'organization' ? url('/web/#/organization-dashboard-screen') : '#') }}" class="btn btn-blue">Go to Home</a>
                     {{--                    <button type="button" disabled class="btn disabled btn-maroon" data-bs-dismiss="modal">Close</button>--}}
                 </div>
             </div>

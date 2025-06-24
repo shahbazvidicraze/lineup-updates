@@ -209,7 +209,7 @@ class StripeController extends Controller
                 catch (\Exception $e) { Log::error("Mail Error (TeamActivationSlotPurchased): {$e->getMessage()}");}
             }
             if ($settings->notify_admin_on_payment && !empty($settings->admin_notification_email)) {
-                try { Mail::to($settings->admin_notification_email)->send(new AdminPaymentReceivedMail($payment)); } // Admin mail might need context
+                try { Mail::to($settings->admin_notification_email)->send(new AdminPaymentReceivedMail($payment, 'user')); } // Admin mail might need context
                 catch (\Exception $e) { Log::error("Mail Error (AdminPayment SlotPurchase): {$e->getMessage()}");}
             }
         } catch (\Exception $e) {
@@ -251,106 +251,6 @@ class StripeController extends Controller
             Log::info("Recorded failed team activation slot payment attempt for PI {$paymentIntent->id}");
         }
     }
-    public function handleWebhookOld(Request $request)
-    {
-        $payload = $request->getContent();
-        $sigHeader = $request->server('HTTP_STRIPE_SIGNATURE');
-        $webhookSecret = config('services.stripe.webhook_secret');
-        if (!$webhookSecret) {
-            Log::critical('Stripe webhook secret is NOT configured.');
-            return $this->errorResponse('Webhook secret not configured.', HttpResponse::HTTP_INTERNAL_SERVER_ERROR);
-        }
-        $event = null;
-        try {
-            $event = Webhook::constructEvent($payload, $sigHeader, $webhookSecret);
-        } catch (UnexpectedValueException | SignatureVerificationException $e) {
-            Log::warning('Stripe Webhook Error: Invalid payload or signature.', ['exception' => $e->getMessage()]);
-            return $this->errorResponse('Invalid webhook payload or signature.', HttpResponse::HTTP_BAD_REQUEST);
-        } catch (\Exception $e) {
-            Log::error('Stripe Webhook Error: Generic construction error.', ['exception' => $e->getMessage()]);
-            return $this->errorResponse('Webhook processing error.', HttpResponse::HTTP_BAD_REQUEST);
-        }
-
-        Log::info('Stripe Webhook Received:', ['type' => $event->type, 'id' => $event->id]);
-        $paymentIntent = $event->data->object; // This is a \Stripe\PaymentIntent
-
-        switch ($event->type) {
-            case 'payment_intent.succeeded':
-                $action = $paymentIntent->metadata->action ?? null;
-                if ($action === 'purchase_team_activation_slot') {
-                    $this->handleDirectTeamActivationSucceeded($paymentIntent);
-                } elseif ($action === 'renew_organization_subscription') {
-                    $this->handleRenewOrganizationSubscriptionSucceeded($paymentIntent);
-                } else {
-                    Log::warning("Webhook PI Succeeded: Unknown or missing 'action' in metadata for PI {$paymentIntent->id}", ['metadata' => $paymentIntent->metadata]);
-                }
-                break;
-            case 'payment_intent.payment_failed':
-                $action = $paymentIntent->metadata->action ?? null;
-                if ($action === 'activate_team_direct') {
-                    $this->handleDirectTeamActivationFailed($paymentIntent);
-                } elseif ($action === 'renew_organization_subscription') {
-                    $this->handleOrganizationSubscriptionFailed($paymentIntent); // Existing method
-                }
-                break;
-            default: Log::info('Received unhandled Stripe event type: ' . $event->type);
-        }
-        return $this->successResponse(null, 'Webhook handled.');
-    }
-
-    protected function handleTeamActivationSlotPurchaseSucceededOld(PaymentIntent $paymentIntent): void
-    {
-        Log::info("Webhook: Handling Team Activation Slot Purchase Succeeded: PI {$paymentIntent->id}");
-        $userId = $paymentIntent->metadata->user_id ?? null;
-        if (!$userId) { Log::error("Webhook SlotPurchase Error: Missing user_id for PI {$paymentIntent->id}"); return; }
-        if (Payment::where('stripe_payment_intent_id', $paymentIntent->id)->exists()) { Log::info("Webhook New Team Activation Info: PI {$paymentIntent->id} already processed."); return; }
-
-        $user = User::find($userId);
-        if (!$user) { Log::error("Webhook SlotPurchase Error: User ID {$userId} not found from PI {$paymentIntent->id}"); return; }
-
-        DB::beginTransaction();
-        try {
-            $payment = Payment::create([
-                'user_id' => $userId,
-                // payable_id/type can be null if payment is just for "slot credits"
-                // or you can link it to the UserTeamActivationSlot model if you want
-                'payable_id' => null, // Or $userTeamActivationSlot->id after creating it
-                'payable_type' => null, // Or UserTeamActivationSlot::class
-                'stripe_payment_intent_id' => $paymentIntent->id,
-                'amount' => $paymentIntent->amount_received, 'currency' => $paymentIntent->currency,
-                'status' => $paymentIntent->status, 'paid_at' => now(),
-            ]);
-
-            $settings = Settings::instance();
-            $durationDays = $settings->access_duration_days > 0 ? $settings->access_duration_days : 365;
-            $slotExpiryDate = Carbon::now()->addDays($durationDays);
-
-            UserTeamActivationSlot::create([
-                'user_id' => $user->id,
-                'status' => 'available',
-                'payment_id' => $payment->id, // Link to the payment
-                'slot_expires_at' => $slotExpiryDate,
-            ]);
-
-            DB::commit();
-            Log::info("Team Activation Slot created for User ID {$userId} via PI {$paymentIntent->id}. Slot Expires: {$slotExpiryDate->toIso8601String()}");
-
-            if ($user->email && $user->receive_payment_notifications) {
-                try { Mail::to($user->email)->send(new TeamActivationSlotPurchasedMail($user, $payment, $slotExpiryDate)); }
-                catch (\Exception $e) { Log::error("Mail Error (TeamActivationSlotPurchased): {$e->getMessage()}");}
-            }
-            // Admin Notification
-            if ($settings->notify_admin_on_payment && !empty($settings->admin_notification_email)) {
-                try { Mail::to($settings->admin_notification_email)->send(new AdminPaymentReceivedMail($payment)); }
-                catch (\Exception $e) { Log::error("Mail Error (AdminPayment TeamActivate): {$e->getMessage()}");}
-            }
-
-        } catch (\Exception $e) {
-            DB::rollBack();
-            Log::critical("CRITICAL: Failed to create team activation slot or payment record: PI {$paymentIntent->id}, User {$userId}. Error: " . $e->getMessage());
-        }
-    }
-
     protected function handleRenewOrganizationSubscriptionSucceeded(PaymentIntent $paymentIntent): void
     {
         Log::info("Webhook: Handling Organization Subscription Renewal Succeeded: PI {$paymentIntent->id}");
@@ -423,7 +323,7 @@ class StripeController extends Controller
             // --- Send Admin Notification Email (if enabled) ---
             if ($settings->notify_admin_on_payment && !empty($settings->admin_notification_email)) {
                 try {
-                    Mail::to($settings->admin_notification_email)->send(new AdminPaymentReceivedMail($payment)); // Pass the $payment object
+                    Mail::to($settings->admin_notification_email)->send(new AdminPaymentReceivedMail($payment, 'organization')); // Pass the $payment object
                     Log::info("Admin payment notification sent for org renewal PI {$paymentIntent->id}");
                 } catch (\Exception $e) {
                     Log::error("Mail Error (AdminPayment OrgRenewal): {$e->getMessage()}");
@@ -494,43 +394,6 @@ class StripeController extends Controller
             // Amount accessor on Payment model handles dollar conversion
             return $payment;
         });
-        return $this->successResponse($payments, 'Payment history retrieved successfully.');
-    }
-    public function userPaymentHistoryOld(Request $request)
-    {
-        /** @var \App\Models\User $user */
-        $user = $request->user();
-        if (!$user) return $this->unauthorizedResponse('User not authenticated.');
-
-        $payments = Payment::where('user_id', $user->id)
-            ->with([
-                'payable' => function ($morphTo) { // Eager load the polymorphic relation
-                    $morphTo->morphWith([
-                        Team::class => ['user:id,first_name', 'organization:id,name'], // Example nested relations for Team
-                        Organization::class => ['creator:id,first_name'] // Example for Organization
-                    ]);
-                }
-            ])
-            ->orderBy('paid_at', 'desc')
-            ->select([
-                'id', 'payable_id', 'payable_type', 'stripe_payment_intent_id',
-                'amount', 'currency', 'status', 'paid_at', 'created_at'
-            ])
-            ->paginate($request->input('per_page', 15));
-
-        // Transform to add context based on payable_type
-        $payments->getCollection()->transform(function ($payment) {
-            if ($payment->payable_type === Team::class && $payment->payable) {
-                $payment->activation_target = "Team: {$payment->payable->name}";
-            } elseif ($payment->payable_type === Organization::class && $payment->payable) {
-                $payment->activation_target = "Organization: {$payment->payable->name}";
-            } else {
-                $payment->activation_target = "Unknown";
-            }
-            // Amount accessor in Payment model handles dollar conversion
-            return $payment;
-        });
-
         return $this->successResponse($payments, 'Payment history retrieved successfully.');
     }
 

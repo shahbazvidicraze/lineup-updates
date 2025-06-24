@@ -9,6 +9,6 @@
 
     Proceed to create your team in the app.
 
-    Thanks,<br>
+    Thanks,
     The {{ $appName }} Team
 </x-mail::message>

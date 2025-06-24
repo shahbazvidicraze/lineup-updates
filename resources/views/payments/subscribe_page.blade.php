@@ -98,7 +98,7 @@
                         <img src="{{ asset('/web/assets/assets/images/dummy_image.png') }}" alt="Avatar Logo" style="width:40px;" class="bg-blue rounded-pill ">
                         <div class="d-flex flex-column m-0 p-0 justify-content-center">
                             <h6 style="line-height: 0.6" class="mt-1 mb-0 p-0 text-maroon">Welcome <span style="font-weight: 200 !important;">&#128075;</span></h6>
-                            <p class="m-0 p-0">{{ $user->first_name }}</p>
+                            <p class="m-0 p-0">{{ isset($user->first_name) ? $user->first_name : $panel_name }}</p>
                         </div>
                     </div>
                 </li>
@@ -110,7 +110,7 @@
 <div class="main-container container">
     <!-- Left Panel -->
     <div class="left-panel text-center">
-        <h2>PURCHASE THE PREMIUM <span class="fw-bold">SUBSCRIPTION</span></h2> {{-- Changed Text --}}
+        <h2>{{ $type == 'organization' ? 'RENEW' :  'PURCHASE' }} THE PREMIUM <span class="fw-bold">SUBSCRIPTION</span></h2> {{-- Changed Text --}}
         @if(isset($paymentDescription))
             <p class="payment-description px-3 text-secondary">{{ $paymentDescription }}</p>
         @endif

@@ -61,7 +61,7 @@ class OrganizationSubscriptionRenewedMail extends Mailable // implements ShouldQ
                 'userName' => $this->payingUser->first_name, // Person who paid for renewal
                 'appName' => config('app.name'),
                 'newExpiryDate' => $this->organization->subscription_expires_at?->toFormattedDayDateString(),
-                'amountFormatted' => number_format($this->payment->amount / 100, 2), // Assuming payment->amount is cents
+                'amountFormatted' => $this->payment->amount, // Assuming payment->amount is dollars
                 'currency' => strtoupper($this->payment->currency),
                 'panelLoginUrl' => url('/organization-panel/login'), // Example
             ],

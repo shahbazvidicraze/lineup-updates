@@ -31,8 +31,20 @@ class TeamController extends Controller
         // $teams = $query->paginate($request->input('per_page', 15));
         // return $this->successResponse($teams, 'Teams retrieved successfully.');
 
+        // Get the user's available team activation slots count
+        // This uses the accessor `getAvailableTeamSlotsCountAttribute` from the User model
+        $availableSlotsCount = $user->available_team_slots_count;
+
+        Log::info("Found " . $teams->count() . " teams and {$availableSlotsCount} available slots for User ID: {$user->id}");
+
+        // Prepare data for the response
+        $responseData = [
+            'teams' => $teams,
+            'available_team_slots_count' => $availableSlotsCount,
+        ];
+
         if ($teams->isNotEmpty()) {
-            return $this->successResponse($teams, 'Teams retrieved successfully.');
+            return $this->successResponse($responseData, 'Teams retrieved successfully.');
         } else {
             return $this->successResponse([], 'No teams created yet.'); // Return empty array
         }

@@ -1,21 +1,32 @@
 <x-mail::message>
-    # New Payment Notification
+    # New Payment Received on {{ $appName }}
 
-    A new payment has been successfully processed on {{ $appName }}.
+    A payment has been successfully processed.
 
     Payment Details:
     - Payment ID (Stripe): `{{ $payment->stripe_payment_intent_id }}`
-    - Amount: ${{ $payment->amount }} {{ strtoupper($payment->currency) }}
+    - Amount: {{ $payment->amount }} {{ $currency }}
     - Date: {{ $payment->paid_at->toFormattedDayDateString() }} at {{ $payment->paid_at->toTimeString() }}
+    
+    @if(isset($entityType))
+        @if($entityType == 'organization')
 
+    For Organization:
+        - Organization ID: {{ $payingOrganization->id }}
+        - Organization Name: {{ $payingOrganization->name }}
+        - Organization Code: {{ $payingOrganization->organization_code }}
+        - Organization Email: {{ $payingOrganization->email }}
+        @endif
+        @if($entityType == 'user')
 
-    User Details:
-    - User Name: {{ $user->first_name }} {{ $user->last_name }}
-    - User Email: `{{ $user->email }}`
+    Paid By User:
+        - User ID: {{ $payingUser->id }}
+        - Name: {{ $payingUser->first_name }} {{ $payingUser->last_name }}
+        - Email: {{ $payingUser->email }}
+        @endif
+    @endif
 
-    User Org. Access Code: `{{ $payment->user_organization_access_code }}`
-
-    The user's subscription access has been activated or extended.
+    Please review the transaction in the Stripe dashboard if necessary.
 
     Thanks,
     {{ $appName }} System

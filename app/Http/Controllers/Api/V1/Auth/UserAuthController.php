@@ -382,7 +382,7 @@ class UserAuthController extends Controller
             }
             return [
                 'record_id' => $payment->record_id,
-                'type' => $payment->type,
+                'type' => "Paid",
                 'date' => Carbon::parse($payment->event_at)->toIso8601String(),
                 'amount_display' => $payment->amount, // Accessor on Payment model handles dollar conversion
                 'currency' => $payment->currency,
@@ -401,7 +401,7 @@ class UserAuthController extends Controller
                 }
                 return [
                     'record_id' => $redemption->record_id,
-                    'type' => $redemption->type,
+                    'type' => "Promo",
                     'date' => Carbon::parse($redemption->event_at)->toIso8601String(),
                     'promo_code' => $redemption->promoCode?->code,
                     'description' => $description,
@@ -424,88 +424,24 @@ class UserAuthController extends Controller
     }
 
     /**
-     * Display the authenticated user's combined history of activations
-     * (payments for slots/teams or promos for slots/teams).
-     * Route: GET /user/activation-history
+     * Get the authenticated user's available team activation slots count.
+     * Route: GET /user/available-team-slots
      */
-    public function activationHistoryOld(Request $request)
+    public function getAvailableTeamSlotsCount(Request $request)
     {
         /** @var \App\Models\User $user */
         $user = $request->user();
 
-        // Fetch Payments made by this user for activation purposes
-        $paidActivations = Payment::where('user_id', $user->id)
-            ->where(function ($query) { // Payments for slots or direct team activations
-                $query->where('payable_type', UserTeamActivationSlot::class)
-                    ->orWhere('payable_type', Team::class); // Or just User::class if payment is for user credit
-            })
-            ->with([
-                'payable.team', // If slot is linked to a team later
-                'payable' // Eager load the polymorphic relation
-            ])
-            ->select('id as record_id', 'payable_id', 'payable_type', 'amount', 'currency', 'status', 'paid_at as event_at', DB::raw("'Payment' as type"))
-            ->get();
+        if (!$user) {
+            return $this->unauthorizedResponse('User not authenticated.');
+        }
 
-        // Fetch Promo Code Redemptions by this user for activation purposes
-        $promoActivations = PromoCodeRedemption::where('user_id', $user->id)
-            ->where(function ($query) { // Promos for slots or direct team activations
-                $query->where('redeemable_type', UserTeamActivationSlot::class)
-                    ->orWhere('redeemable_type', Team::class);
-            })
-            ->with([
-                'promoCode:id,code,description',
-                'redeemable.team' // If slot is linked to a team
-            ])
-            ->select('id as record_id', 'promo_code_id', 'redeemable_id', 'redeemable_type', 'redeemed_at as event_at', DB::raw("'Promo Code' as type"))
-            ->get();
+        // This uses the accessor defined in the User model
+        $availableSlotsCount = $user->available_team_slots_count;
 
-        // Combine and map to a consistent structure
-        $history = $paidActivations->map(function ($payment) {
-            $target = null;
-            if ($payment->payable_type === UserTeamActivationSlot::class && $payment->payable) {
-                $target = "Team Activation Slot ID: {$payment->payable->id}";
-                if ($payment->payable->team) $target .= " (Used for Team: {$payment->payable->team->name})";
-            } elseif ($payment->payable_type === Team::class && $payment->payable) {
-                $target = "Team: {$payment->payable->name}";
-            }
-            return [
-                'record_id' => $payment->record_id,
-                'type' => $payment->type,
-                'date' => Carbon::parse($payment->event_at)->toIso8601String(),
-                'amount_display' => $payment->amount, // Accessor on Payment model handles dollar conversion
-                'currency' => $payment->currency,
-                'status' => $payment->status,
-                'description' => $target ?? "User Account Activation/Credit",
-            ];
-        })->concat(
-            $promoActivations->map(function ($redemption) {
-                $target = null;
-                if ($redemption->redeemable_type === UserTeamActivationSlot::class && $redemption->redeemable) {
-                    $target = "Team Activation Slot ID: {$redemption->redeemable->id}";
-                    if ($redemption->redeemable->team) $target .= " (Used for Team: {$redemption->redeemable->team->name})";
-                } elseif ($redemption->redeemable_type === Team::class && $redemption->redeemable) {
-                    $target = "Team: {$redemption->redeemable->name}";
-                }
-                return [
-                    'record_id' => $redemption->record_id,
-                    'type' => $redemption->type,
-                    'date' => Carbon::parse($redemption->event_at)->toIso8601String(),
-                    'promo_code' => $redemption->promoCode?->code,
-                    'description' => $target ?? "User Account Activation/Credit",
-                ];
-            })
-        )->sortByDesc('date')->values(); // Sort combined results by event date
-
-        // Manual Pagination for the combined collection
-        $perPage = $request->input('per_page', 15);
-        $currentPage = $request->input('page', 1);
-        $currentPageItems = $history->slice(($currentPage - 1) * $perPage, $perPage)->values();
-
-        $paginatedHistory = new \Illuminate\Pagination\LengthAwarePaginator(
-            $currentPageItems, $history->count(), $perPage, $currentPage,
-            ['path' => $request->url(), 'query' => $request->query()]
+        return $this->successResponse(
+            ['available_team_slots_count' => $availableSlotsCount],
+            'Available team activation slots count retrieved successfully.'
         );
-
-        return $this->successResponse($paginatedHistory, 'User activation history retrieved.');
     }
 }
