@@ -5,7 +5,7 @@
 
     Great news! Your team, "{{ $teamName }}", has been successfully activated on {{ $appName }}.
 
-    Premium features for this team (like PDF lineup generation) are now available until {{ $expiresAt }}.
+    Premium features for this team are now available until {{ $expiresAt }}.
 
     You can manage your team and create lineups within the app.
 

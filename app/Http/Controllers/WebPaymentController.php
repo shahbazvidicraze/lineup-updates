@@ -105,7 +105,8 @@ class WebPaymentController extends Controller
                     'paying_user_id' => $user->id, // User purchasing the slot
                     'user_email' => $user->email,
                     'action' => 'purchase_team_activation_slot', // For webhook processing
-                    'payment_description' => $paymentDescription
+                    'payment_description' => $paymentDescription,
+                    'successMsg'=>'Your Team Activation Slot is being processed and will be available shortly. Check your email for confirmation.'
                 ],
             ]);
             Log::info("Web Flow: Created Team Activation Slot PI {$paymentIntent->id} for User ID {$user->id}");
@@ -122,6 +123,142 @@ class WebPaymentController extends Controller
                 'displayCurrencySymbolPosition' => $settings->unlock_currency_symbol_position,
                 'currency' => $currency,
                 'returnUrl' => route('payment.return.general'), // Generic return URL
+            ]);
+        } catch (ApiErrorException $e) {
+            Log::error("Web Flow: Stripe Team Slot PI API error for User {$user->id}: " . $e->getMessage());
+            return view('payments.failed', [
+                'displayAmount' => number_format($amountInDollars,2),
+                'displayCurrencySymbol' => $settings->unlock_currency_symbol,
+                'displayCurrencySymbolPosition' => $settings->unlock_currency_symbol_position,
+                'currency' => $currency,
+                'paymentDescription' => $paymentDescription,
+                'type' => 'user',
+                'user' => $user,
+                'amount' => $amountInDollars,
+                'pageTitle' => 'Payment Initiation Failed',
+                'messageBody' => 'Failed to initiate payment: ' . ($e->getError()?->message ?: 'Stripe API error.')
+            ]);
+        } catch (\Exception $e) {
+            Log::error("Web Flow: Generic error Team Slot PI for User {$user->id}: " . $e->getMessage());
+            return view('payments.failed', [
+                'displayAmount' => number_format($amountInDollars,2),
+                'displayCurrencySymbol' => $settings->unlock_currency_symbol,
+                'displayCurrencySymbolPosition' => $settings->unlock_currency_symbol_position,
+                'currency' => $currency,
+                'paymentDescription' => $paymentDescription,
+                'type' => 'user',
+                'user' => $user,
+                'amount' => $amountInDollars,
+                'pageTitle' => 'Error',
+                'messageBody' => 'An unexpected error occurred while initiating your payment.'
+            ]);
+        }
+    }
+
+    /**
+     * Show payment page for a User to RENEW a specific INDEPENDENT team's activation (Path A).
+     * {team} is injected via route model binding from the signed URL.
+     * Route Name: 'team.payment.initiate.renewal'
+     */
+    public function showDirectTeamRenewalPage(Request $request, Team $team): View
+    {
+        $settings = Settings::instance();
+        $amountInDollars = (float) $settings->unlock_price_amount;
+        $currency = $settings->unlock_currency;
+        $amountInCents = (int) round($amountInDollars * 100);
+        $paymentDescription = "Complete your payment to renew premium features for team '{$team->name}' for another " . ($settings->access_duration_days ?? 365) . " days.";
+        $user = $team->user; // Owner of the team
+        if (!$user) { return view('payments.failed', [
+            'displayAmount' => number_format($amountInDollars,2),
+            'displayCurrencySymbol' => $settings->unlock_currency_symbol,
+            'displayCurrencySymbolPosition' => $settings->unlock_currency_symbol_position,
+            'currency' => $currency,
+            'paymentDescription' => $paymentDescription,
+            'type' => 'user',
+            'user' => $user,
+            'amount' => $amountInDollars,'pageTitle' => 'Error', 'messageBody' => 'Team owner not found.']); }
+
+        if ($team->organization_id) {
+            return view('payments.failed', [
+                'displayAmount' => number_format($amountInDollars,2),
+                'displayCurrencySymbol' => $settings->unlock_currency_symbol,
+                'displayCurrencySymbolPosition' => $settings->unlock_currency_symbol_position,
+                'currency' => $currency,
+                'paymentDescription' => $paymentDescription,
+                'type' => 'user',
+                'user' => $user,
+                'amount' => $amountInDollars,'pageTitle' => 'Renewal Error', 'messageBody' => "Team '{$team->name}' is linked to an organization. Its premium features are managed by the organization's subscription."]);
+        }
+        // Optional: Logic to allow renewal only if near expiry or expired
+        // if ($team->direct_activation_status === 'active' && $team->direct_activation_expires_at && $team->direct_activation_expires_at->gt(now()->addMonths(1))) {
+        //     return view('payments.success', ['pageTitle' => 'Activation Current', 'messageBody' => "Team '{$team->name}' activation is current until " . $team->direct_activation_expires_at->toFormattedDayDateString() . "."]);
+        // }
+
+        if (strtolower($currency) === 'usd' && $amountInCents < 50) {
+            Log::error("Web Payment Error: Slot purchase amount {$amountInCents}c for User ID {$user->id} is below minimum.");
+            return view('payments.failed', [
+                'displayAmount' => number_format($amountInDollars,2),
+                'displayCurrencySymbol' => $settings->unlock_currency_symbol,
+                'displayCurrencySymbolPosition' => $settings->unlock_currency_symbol_position,
+                'currency' => $currency,
+                'paymentDescription' => $paymentDescription,
+                'type' => 'user', 'user' => $user,
+                'amount' => $amountInDollars,
+                'pageTitle' => 'Payment Error',
+                'messageBody' => 'The activation price is below the minimum allowed. Please contact support.'
+            ]);
+        }
+        if (empty($currency)) {
+            Log::error("Web Payment Error: Currency not set for slot purchase by User ID {$user->id}.");
+            return view('payments.failed', [
+                'displayAmount' => number_format($amountInDollars,2),
+                'displayCurrencySymbol' => $settings->unlock_currency_symbol,
+                'displayCurrencySymbolPosition' => $settings->unlock_currency_symbol_position,
+                'currency' => $currency,
+                'paymentDescription' => $paymentDescription,
+                'type' => 'user',
+                'user' => $user,
+                'amount' => $amountInDollars,
+                'pageTitle' => 'Configuration Error',
+                'messageBody' => 'Payment currency is not configured. Please contact support.'
+            ]);
+        }
+
+        try {
+            if (!$user->stripe_customer_id) {
+                $customer = StripeCustomer::create(['email' => $user->email, 'name' => $user->full_name, 'metadata' => ['app_user_id' => $user->id]]);
+                $user->stripe_customer_id = $customer->id;
+                $user->saveQuietly();
+            }
+
+            $paymentIntent = PaymentIntent::create([
+                'amount' => $amountInCents, 'currency' => $currency,
+                'customer' => $user->stripe_customer_id,
+                'automatic_payment_methods' => ['enabled' => true],
+                'description' => "Direct RENEWAL for Team: {$team->name} (ID: {$team->id}) by User {$user->email}",
+                'metadata' => [
+                    'type' => 'user',
+                    'paying_user_id' => $user->id,
+                    'team_id' => $team->id,
+                    'action' => 'renew_team_direct', // NEW action for webhook
+                    'payment_description' => $paymentDescription,
+                    'successMsg' => "Your Team Activation Renewal is being processed and will be updated shortly. Check your email for confirmation."
+                ],
+            ]);
+            Log::info("Web Flow: Direct Team Renewal PI {$paymentIntent->id} for Team ID {$team->id}, User ID {$user->id}");
+
+            return view('payments.subscribe_page', [
+                'type' => 'user',
+                'stripeKey' => config('services.stripe.key'),
+                'clientSecret' => $paymentIntent->client_secret,
+                'paymentTitle' => "Renew Activation: " . $team->name,
+                'paymentDescription' => $paymentDescription,
+                'user' => $user,
+                'displayAmount' => number_format($amountInDollars, 2),
+                'displayCurrencySymbol' => $settings->unlock_currency_symbol,
+                'displayCurrencySymbolPosition' => $settings->unlock_currency_symbol_position,
+                'currency' => $currency,
+                'returnUrl' => route('payment.return.general'),
             ]);
         } catch (ApiErrorException $e) {
             Log::error("Web Flow: Stripe Team Slot PI API error for User {$user->id}: " . $e->getMessage());
@@ -285,7 +422,8 @@ class WebPaymentController extends Controller
                     // 'paying_user_id' is less relevant here if payment is by "the organization" itself.
                     // Could add creator_user_id if you want to log who *might* be doing it via panel.
                     'action' => 'renew_organization_subscription',
-                    'payment_description' => $paymentDescription
+                    'payment_description' => $paymentDescription,
+                    'successMsg' => 'Subscription renewal for '.$organization->name.' is being processed. Your access will be updated shortly.'
                 ],
             ]);
             Log::info("Web Flow: Org Renewal PI {$paymentIntent->id} created for Org ID {$organization->id}");
@@ -371,17 +509,17 @@ class WebPaymentController extends Controller
 
             if ($paymentIntent->status === 'succeeded') {
                 $action = $paymentIntent->metadata->action ?? 'payment';
-                $messageBody = 'Your payment was successful! ';
+                $messageBody = isset($paymentIntent->metadata->successMsg) ? $paymentIntent->metadata->successMsg : 'Your account or service status will be updated shortly via email.';
                 $pageTitle = 'Payment Successful!';
 
-                if ($action === 'purchase_team_activation_slot') {
-                    $messageBody .= 'Your Team Activation Slot is being processed and will be available shortly. Check your email for confirmation.';
-                } elseif ($action === 'renew_organization_subscription') {
-                    $orgName = $paymentIntent->metadata->organization_name_from_pi ?? ($paymentIntent->metadata->organization_code ?? 'Your organization');
-                    $messageBody .= "Subscription renewal for '{$orgName}' is being processed. Your access will be updated shortly.";
-                } else {
-                    $messageBody .= 'Your account or service status will be updated shortly via email.';
-                }
+//                if ($action === 'purchase_team_activation_slot') {
+//                    $messageBody .= 'Your Team Activation Slot is being processed and will be available shortly. Check your email for confirmation.';
+//                } elseif ($action === 'renew_organization_subscription') {
+//                    $orgName = $paymentIntent->metadata->organization_name_from_pi ?? ($paymentIntent->metadata->organization_code ?? 'Your organization');
+//                    $messageBody .= "Subscription renewal for '{$orgName}' is being processed. Your access will be updated shortly.";
+//                } else {
+//                    $messageBody .= 'Your account or service status will be updated shortly via email.';
+//                }
                 return view('payments.success', [
                     'paymentDescription' => $paymentDescription,
                     'type' => $type,

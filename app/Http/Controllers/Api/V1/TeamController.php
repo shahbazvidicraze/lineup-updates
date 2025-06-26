@@ -7,6 +7,7 @@ use App\Http\Traits\ApiResponseTrait;
 use App\Models\Team;
 use App\Models\User; // Import User
 use App\Models\Organization; // Import Organization
+use Illuminate\Auth\Access\AuthorizationException;
 use Illuminate\Http\Request;
 use Illuminate\Support\Facades\DB;
 use Illuminate\Support\Facades\Validator;
@@ -200,6 +201,11 @@ class TeamController extends Controller
 
     public function show(Request $request, Team $team)
     {
+        try {
+            $this->authorize('view', $team);
+        } catch (AuthorizationException $e) {
+            return $this->forbiddenResponse('You do not have permission to view this team.');
+        }
         if ($request->user()->id !== $team->user_id) return $this->forbiddenResponse('You do not own this team.');
         $team->load(['organization:id,name,organization_code', 'games', 'players' => function($q){
             $q->select(['id', 'team_id', 'first_name', 'last_name', 'jersey_number', 'email']); // Select specific player columns
@@ -209,7 +215,17 @@ class TeamController extends Controller
 
     public function update(Request $request, Team $team)
     {
-        $this->authorize('update', $team); // Policy checks ownership & if team is editable
+        try {
+            // This will call TeamPolicy@update
+            $this->authorize('update', $team);
+        } catch (AuthorizationException $e) {
+            // Customize message based on why it might have failed
+            // For now, a generic one. The policy handles the logic.
+            if (!$team->isEditable()) {
+                return $this->forbiddenResponse('This team is no longer editable as its activity period has expired.');
+            }
+            return $this->forbiddenResponse('You do not have permission to update this team.');
+        }
 
         if ($request->user()->id !== $team->user_id) return $this->forbiddenResponse('You do not own this team.');
         $validator = Validator::make($request->all(), [ /* same as store but 'sometimes|required' */
@@ -221,6 +237,9 @@ class TeamController extends Controller
             'city' => 'nullable|string|max:100', 'state' => 'nullable|string|max:100',
             'country' => 'nullable|string|max:100', 'organization_id' => 'nullable|exists:organizations,id',
             'is_setup_complete' => 'sometimes|boolean',
+            'direct_activation_status' => 'sometimes|string|in:active,inactive',
+            'direct_activation_expires_at' => 'sometimes|date',
+            'is_editable_until' => 'sometimes|date',
         ]);
         if ($validator->fails()) return $this->validationErrorResponse($validator);
 
@@ -239,6 +258,14 @@ class TeamController extends Controller
 
     public function destroy(Request $request, Team $team)
     {
+        try {
+            $this->authorize('delete', $team);
+        } catch (AuthorizationException $e) {
+            if (!$team->isEditable()) {
+                return $this->forbiddenResponse('This team is no longer editable and cannot be deleted as its activity period has expired.');
+            }
+            return $this->forbiddenResponse('You do not have permission to delete this team.');
+        }
         if ($request->user()->id !== $team->user_id) return $this->forbiddenResponse('You do not own this team.');
         $team->delete();
         return $this->successResponse(null, 'Team deleted successfully.', Response::HTTP_OK, false);
@@ -257,5 +284,84 @@ class TeamController extends Controller
             return $this->successResponse($players, 'Players retrieved successfully.');
         }
         return $this->successResponse([], 'No players found for this team.');
+    }
+
+    /**
+     * Check and return the editability status of a team with reasons.
+     * Route: GET /teams/{team}/check-editability
+     */
+    public function checkEditability(Request $request, Team $team)
+    {
+        try {
+            $this->authorize('view', $team); // User must own the team
+        } catch (AuthorizationException $e) {
+            return $this->forbiddenResponse('You do not own this team.');
+        }
+
+        $isEditableByInitialWindow = (!$team->is_editable_until || $team->is_editable_until->isFuture());
+        $team->loadMissing('organization'); // Ensure organization is loaded
+
+        $isEffectivelyEditable = $team->isEditable(); // This is the final truth from the model
+        $message = $isEffectivelyEditable ? "Team '{$team->name}' is currently editable." : "Team '{$team->name}' is currently not editable.";
+        $reason = '';
+
+        if ($isEffectivelyEditable) {
+            if (!$team->organization_id && !$isEditableByInitialWindow) { // Should not happen if isEffectivelyEditable is true
+                $reason = "Error: Team is marked editable but its initial edit window has passed. Please check logic.";
+            } elseif ($team->organization_id && $team->organization && $team->organization->hasActiveSubscription()) {
+                $reason = "Editability is granted via active subscription of organization '{$team->organization->name}' (Org expires: {$team->organization->subscription_expires_at?->toFormattedDayDateString()}). Team's initial edit window (from creation) expires on {$team->is_editable_until?->toFormattedDayDateString()}.";
+            } elseif (!$team->organization_id && $team->direct_activation_status === 'active' && $team->direct_activation_expires_at && $team->direct_activation_expires_at->isFuture()) {
+                $reason = "Team has an active direct activation expiring on {$team->direct_activation_expires_at?->toFormattedDayDateString()}. Team's initial edit window (from creation) expires on {$team->is_editable_until?->toFormattedDayDateString()}.";
+            } else {
+                $reason = "Team is within its initial editability window (expires {$team->is_editable_until?->toFormattedDayDateString()}) and no specific activation is currently extending it further but one path allows editability.";
+            }
+        } else { // Not Editable
+            if ($team->organization_id && $team->organization) {
+                if (!$team->organization->hasActiveSubscription()) {
+                    $reason = "The parent organization '{$team->organization->name}' does not have an active subscription.";
+                    if ($team->organization->subscription_expires_at && $team->organization->subscription_expires_at->isPast()) {
+                        $reason .= " Its subscription expired on " . $team->organization->subscription_expires_at->toFormattedDayDateString() . ". Please contact the organization admin to renew.";
+                    } else {
+                        $reason .= " Please contact the organization admin for activation.";
+                    }
+                }else{
+                    $reason = "The parent organization '{$team->organization->name}' have an active subscription.";
+                    if ($team->organization->subscription_expires_at && $team->organization->subscription_expires_at->isFuture()) {
+                        $reason .= " Its subscription will expire on " . $team->organization->subscription_expires_at->toFormattedDayDateString() . ".";
+                        $isEffectivelyEditable = true;
+                    }
+                }
+            }elseif (!$isEditableByInitialWindow) {
+                $reason = "The initial 1-year editability period for this team (created on {$team->created_at->toFormattedDayDateString()}) expired on {$team->is_editable_until->toFormattedDayDateString()}.";
+            } elseif (!$team->organization_id) { // Independent team
+                if (!($team->direct_activation_status === 'active' && $team->direct_activation_expires_at && $team->direct_activation_expires_at->isFuture())) {
+                    $reason = "This independent team's direct activation has expired or is inactive.";
+                    if ($team->direct_activation_expires_at && $team->direct_activation_expires_at->isPast()){
+                        $reason .= " It expired on " . $team->direct_activation_expires_at->toFormattedDayDateString() . ". Please renew this team's activation directly.";
+                    } else {
+                        $reason .= " Please activate this team directly via payment or promo.";
+                    }
+                }
+            } else {
+                $reason = "Team is not editable due to an undetermined reason (possibly inactive or not owned).";
+            }
+        }
+
+        return $this->successResponse([
+            'team_id' => $team->id,
+            'team_name' => $team->name,
+            'is_editable' => $isEffectivelyEditable, // Use the model's definitive answer
+            'reason' => $reason,
+//            'details' => [ // More detailed breakdown for client debugging/logic
+//                'initial_edit_window_active' => $isEditableByInitialWindow,
+//                'team_initial_edit_expiry' => $team->is_editable_until?->toISOString(),
+//                'direct_activation_status' => $team->direct_activation_status,
+//                'direct_activation_expires_at' => $team->direct_activation_expires_at?->toISOString(),
+//                'is_linked_to_organization' => (bool)$team->organization_id,
+//                'organization_name' => $team->organization?->name,
+//                'organization_subscription_active' => $team->organization?->hasActiveSubscription(),
+//                'organization_subscription_expires_at' => $team->organization?->subscription_expires_at?->toISOString(),
+//            ]
+        ], $message);
     }
 }

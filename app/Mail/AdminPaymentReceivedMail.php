@@ -24,6 +24,8 @@ class AdminPaymentReceivedMail extends Mailable // implements ShouldQueue
     public ?User $payingUser;      // User who made the payment (can be null if system initiated for an org)
 
     public ?Organization $payingOrganization;
+
+    public ?Team $payingTeam;
     public $relatedEntity;       // Could be User (for slot), Organization, or null
     public string $paymentContext;  // e.g., "User Team Slot Purchase", "Organization Subscription Renewal"
     public string $entityType;      // 'user' or 'organization'
@@ -43,7 +45,14 @@ class AdminPaymentReceivedMail extends Mailable // implements ShouldQueue
 
         $this->payingOrganization = new Organization(['name' => 'System']);
         // Determine the primary related entity and payment context
-        if ($this->entityType === 'organization' && $payment->payable_type === Organization::class) {
+        if ($this->entityType === 'team' && $payment->payable_type === Team::class) {
+            $this->payment->loadMissing('payable'); // payable is Team
+            $this->relatedEntity = $payment->payable;
+            $this->payingTeam = $payment->payable;
+            $this->payingUser = $this->payingTeam->user;
+            $this->paymentContext = "Team Activation Renewal for '{$this->relatedEntity?->name}'";
+
+        }elseif ($this->entityType === 'organization' && $payment->payable_type === Organization::class) {
             $this->payment->loadMissing('payable'); // payable is Organization
             $this->relatedEntity = $payment->payable;
             $this->payingOrganization = $payment->payable;

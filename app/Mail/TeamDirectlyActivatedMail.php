@@ -30,7 +30,7 @@ class TeamDirectlyActivatedMail extends Mailable // implements ShouldQueue
     public function content(): Content
     {
         return new Content(
-            markdown: 'emails.user.team-directly-activated',
+            markdown: 'emails.user.team-activated',
             with: [
                 'userName' => $this->user->first_name,
                 'teamName' => $this->team->name,

@@ -17,7 +17,7 @@
         - Organization Code: {{ $payingOrganization->organization_code }}
         - Organization Email: {{ $payingOrganization->email }}
         @endif
-        @if($entityType == 'user')
+        @if($entityType == 'user' || $entityType == 'team')
 
     Paid By User:
         - User ID: {{ $payingUser->id }}

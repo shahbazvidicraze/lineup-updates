@@ -42,6 +42,35 @@ class StripeController extends Controller
     }
 
     /**
+     * User gets a signed web link to RENEW a specific INDEPENDENT team's activation (Path A).
+     * Route: GET /teams/{team}/generate-direct-renewal-link (User Auth)
+     */
+    public function generateDirectTeamRenewalLink(Request $request, Team $team)
+    {
+        /** @var \App\Models\User $user */
+        $user = $request->user();
+        if ($user->id !== $team->user_id) return $this->forbiddenResponse('You do not own this team.');
+        if ($team->organization_id) return $this->errorResponse('This team is managed by an organization; renewal is via the organization.', \Illuminate\Http\Response::HTTP_BAD_REQUEST);
+
+        // Optional: Add logic to prevent renewal if current activation is very far in the future
+        // if ($team->direct_activation_status === 'active' && $team->direct_activation_expires_at && $team->direct_activation_expires_at->gt(now()->addMonths(11))) {
+        //     return $this->errorResponse('This team\'s activation can be renewed closer to its expiry date.', \Illuminate\Http\Response::HTTP_CONFLICT);
+        // }
+
+        try {
+            $signedUrl = URL::temporarySignedRoute(
+                'team.payment.initiate.renewal', // Name of the new web route
+                now()->addMinutes(30),
+                ['team' => $team->id] // Pass team ID
+            );
+            return $this->successResponse(['payment_url' => $signedUrl], 'Secure payment link for team renewal generated.');
+        } catch (\Exception $e) {
+            \Illuminate\Support\Facades\Log::error("Failed to generate team renewal link for Team ID {$team->id}: " . $e->getMessage());
+            return $this->errorResponse('Could not generate renewal link.', \Illuminate\Http\Response::HTTP_INTERNAL_SERVER_ERROR);
+        }
+    }
+
+    /**
      * Generates a secure, temporary signed URL for the web-based new organization subscription payment page.
      * Route: GET /user/subscription/generate-payment-link
      */
@@ -152,6 +181,8 @@ class StripeController extends Controller
                 if ($action === 'purchase_team_activation_slot') {
                     $this->handleTeamActivationSlotPurchaseSucceeded($paymentIntent);
                     Log::info("Team Activation Slot Purchase Succeeded........");
+                } elseif ($action === 'renew_team_direct') { // Specific renewal action
+                    $this->handleDirectTeamActivationSucceeded($paymentIntent, true); // true for isRenewal
                 } elseif ($action === 'renew_organization_subscription') {
                     $this->handleRenewOrganizationSubscriptionSucceeded($paymentIntent);
                 } else {
@@ -170,6 +201,65 @@ class StripeController extends Controller
             default: Log::info('Received unhandled Stripe event type: ' . $event->type);
         }
         return $this->successResponse(null, 'Webhook handled.');
+    }
+
+    // Modify handleDirectTeamActivationSucceeded to accept a renewal flag
+    protected function handleDirectTeamActivationSucceeded(PaymentIntent $paymentIntent, bool $isRenewal = false): void
+    {
+        Log::info("Handling Direct Team Activation/Renewal Succeeded: PI {$paymentIntent->id}, Is Renewal: " . ($isRenewal ? 'Yes' : 'No'));
+        $teamId = $paymentIntent->metadata->team_id ?? null;
+        $userId = $paymentIntent->metadata->paying_user_id ?? null;
+
+        if (!$teamId || !$userId) { Log::error("Webhook Team Activation Renew Error: Missing user_id or team_id for PI {$paymentIntent->id}"); return;  }
+        if (Payment::where('stripe_payment_intent_id', $paymentIntent->id)->exists()) {  return; }
+
+        $team = Team::find($teamId);
+        $user = User::find($userId);
+
+//        if (!$team || !$user || $team->user_id != $userId) { /* ... error log & return ... */ }
+        if ($team->organization_id && !$isRenewal) { Log::error("Webhook Team Activation Renew Error: Team linked with an organization."); /* ... error log, this path is for independent teams ... */ return; }
+
+        DB::beginTransaction();
+        try {
+            $payment = Payment::create([ /* ... payment data ... */
+                'user_id' => $userId, 'payable_id' => $team->id, 'payable_type' => Team::class,
+                'stripe_payment_intent_id' => $paymentIntent->id,
+                'amount' => $paymentIntent->amount_received, 'currency' => $paymentIntent->currency,
+                'status' => $paymentIntent->status, 'paid_at' => now(),
+            ]);
+
+            $settings = Settings::instance();
+            $durationDays = $settings->access_duration_days > 0 ? $settings->access_duration_days : 365;
+
+            // For renewal, add to current future expiry if it exists, otherwise from now
+            $newActivationExpiry = ($isRenewal && $team->direct_activation_expires_at && $team->direct_activation_expires_at->isFuture())
+                ? $team->direct_activation_expires_at->addDays($durationDays)
+                : Carbon::now()->addDays($durationDays);
+
+            $team->activateDirectly($newActivationExpiry); // This method updates status and both expiry dates
+
+            DB::commit();
+            $logMessage = $isRenewal ? "Direct renewal" : "Direct activation";
+            Log::info("{$logMessage} for Team ID {$teamId} by User ID {$userId} via PI {$paymentIntent->id}. Expires: {$team->direct_activation_expires_at->toIso8601String()}");
+
+            if ($user->email && $user->receive_payment_notifications) {
+                try {
+                    // Consider a specific TeamDirectlyRenewedMail if message needs to be different
+                    Mail::to($user->email)->send(new TeamDirectlyActivatedMail($team, $user));
+                    Log::info("User notification sent for team " . ($isRenewal ? "renewal" : "activation") . " for Team ID {$teamId}");
+                }
+                catch (\Exception $e) { Log::error("Mail Error (TeamDirectActivate/Renew): {$e->getMessage()}");}
+            }
+            // ... Admin notification ...
+
+            if ($settings->notify_admin_on_payment && !empty($settings->admin_notification_email)) {
+                try { Mail::to($settings->admin_notification_email)->send(new AdminPaymentReceivedMail($payment, 'team')); } // Admin mail might need context
+                catch (\Exception $e) { Log::error("Mail Error (AdminPayment SlotPurchase): {$e->getMessage()}");}
+            }
+        } catch (\Exception $e) {
+            DB::rollBack();
+            Log::critical("CRITICAL: Failed to create team activation renewal: PI {$paymentIntent->id}, User {$userId}. Error: " . $e->getMessage());
+        }
     }
 
     protected function handleTeamActivationSlotPurchaseSucceeded(PaymentIntent $paymentIntent): void
